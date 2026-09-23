@@ -24,7 +24,7 @@ const LIVE_SYNC_INTERVAL_MS = 1_000;
 // Hearts / lives. Purely informational state that the frontend MAY render.
 // Server is the single source of truth: hearts = MAX_HEARTS - misses (floor 0).
 // Never used to force-end a round — that decision stays with the client.
-const MAX_HEARTS = 5;
+const MAX_HEARTS = 3;
 
 // --- Profile validation defaults ---
 const DEFAULT_NICK = "Player";
