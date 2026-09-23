@@ -26,7 +26,7 @@ const MATCH_RETENTION_AFTER_END = 30_000;
 const LIVE_SYNC_INTERVAL_MS = 1_000;
 
 // Hearts: purely informational. hearts = MAX_HEARTS - misses (floor 0).
-const MAX_HEARTS = 5;
+const MAX_HEARTS = 3;
 
 // --- Profile validation defaults ---
 const DEFAULT_NICK = "Player";
