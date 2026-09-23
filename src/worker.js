@@ -5,24 +5,23 @@
 const MAX_PLAYERS_PER_MATCH = 2;
 const TOTAL_ROUNDS = 3;
 const RECONNECT_GRACE = 15_000;
-const ROUND_TIME = 15_000;
+// More play time, while reducing non-game waiting time.
+const ROUND_TIME = 20_000;
+const MATCH_START_DELAY = 750;
+const MATCH_COUNTDOWN_MS = 1_000;
 const NEXT_ROUND_DELAY = 5_000;
-const FINAL_RESULT_DELAY = 1_500;
+const FINAL_RESULT_DELAY = 500;
 
 const DEFAULT_NICK = "Player";
 const DEFAULT_CC = "XX";
 const NICK_MAX_LEN = 16;
 const CC_REGEX = /^[A-Za-z]{2}$/;
-const MP_AVATARS = [
-  "brain", "cube", "robot", "fox", "penguin", "bolt", "owl",
-  "cat", "dragon", "astro", "ninja"
-];
+const MP_AVATARS = ["brain", "cube", "robot", "fox", "penguin", "bolt", "owl", "cat", "dragon", "astro", "ninja"];
 
 function sanitizeNick(raw) {
   if (typeof raw !== "string") return DEFAULT_NICK;
-  let value = raw.replace(/[^\p{L}\p{N}\s_\-.]/gu, "").trim();
-  if (!value) return DEFAULT_NICK;
-  return value.slice(0, NICK_MAX_LEN);
+  const value = raw.replace(/[^\p{L}\p{N}\s_\-.]/gu, "").trim();
+  return value ? value.slice(0, NICK_MAX_LEN) : DEFAULT_NICK;
 }
 
 function sanitizeCC(raw) {
@@ -55,8 +54,7 @@ export default {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         return new Response("WebSocket upgrade required", { status: 426 });
       }
-      const stub = env.MATCHMAKER.get(env.MATCHMAKER.idFromName("global"));
-      return stub.fetch(request);
+      return env.MATCHMAKER.get(env.MATCHMAKER.idFromName("global")).fetch(request);
     }
     return new Response("Memory Matrix Multiplayer Backend", {
       status: 200,
@@ -84,7 +82,6 @@ export class MatchMakerDO {
     this.matches = new Map(Array.isArray(data.matches) ? data.matches : []);
     for (const match of this.matches.values()) {
       if (!(match.disconnected instanceof Map)) match.disconnected = new Map();
-      // Backward-compatible defaults for matches persisted by older versions.
       match.nicks ||= [DEFAULT_NICK, DEFAULT_NICK];
       match.ccs ||= [DEFAULT_CC, DEFAULT_CC];
       match.avatars ||= ["brain", "brain"];
@@ -193,7 +190,15 @@ export class MatchMakerDO {
   }
 
   profile(player) {
-    return { nick: player.nick, cc: player.cc, av: player.avatar };
+    return { id: player.id, nick: player.nick, cc: player.cc, av: player.avatar, connected: player.connected };
+  }
+
+  matchProfiles(match) {
+    return match.players.map((id, seat) => ({
+      id, nick: match.nicks[seat], cc: match.ccs[seat], av: match.avatars[seat],
+      connected: !!this.players.get(id)?.connected,
+      score: match.scores[seat], total: match.scores[seat]
+    }));
   }
 
   async createMatch(a, b) {
@@ -207,15 +212,15 @@ export class MatchMakerDO {
     this.matches.set(matchId, match);
     a.matchId = b.matchId = matchId;
     a.seat = 0; b.seat = 1;
-    this.send(a, { t: "matched", m: matchId, you: 0, opp: this.profile(b), rounds: TOTAL_ROUNDS, now: Date.now() });
-    this.send(b, { t: "matched", m: matchId, you: 1, opp: this.profile(a), rounds: TOTAL_ROUNDS, now: Date.now() });
+    this.send(a, { t: "matched", m: matchId, you: 0, opp: this.profile(b), rounds: TOTAL_ROUNDS, now: Date.now(), players: this.matchProfiles(match) });
+    this.send(b, { t: "matched", m: matchId, you: 1, opp: this.profile(a), rounds: TOTAL_ROUNDS, now: Date.now(), players: this.matchProfiles(match) });
     setTimeout(() => {
       const m = this.matches.get(matchId);
       if (!m || m.state !== "matched") return;
       m.state = "countdown";
-      this.broadcast(m, { t: "count", n: 3 });
-      setTimeout(() => this.startRound(m), 3000);
-    }, 200);
+      this.broadcast(m, { t: "count", n: 1, startsAt: Date.now() + MATCH_COUNTDOWN_MS, now: Date.now() });
+      setTimeout(() => this.startRound(m), MATCH_COUNTDOWN_MS);
+    }, MATCH_START_DELAY);
     await this.save();
   }
 
@@ -238,9 +243,9 @@ export class MatchMakerDO {
     this.broadcast(match, {
       t: "round", r: round, spec, seed, reveal: spec.reveal, recall: spec.recall,
       deadline: ROUND_TIME, startedAt, endsAt: deadline, roundStartAt: startedAt,
-      roundEndAt: deadline, now: Date.now()
+      roundEndAt: deadline, now: Date.now(), players: this.matchProfiles(match)
     });
-    setTimeout(() => this.finishRound(match.id), ROUND_TIME + 100);
+    setTimeout(() => this.finishRound(match.id), ROUND_TIME + 50);
     await this.save();
   }
 
@@ -261,11 +266,18 @@ export class MatchMakerDO {
     const seat = player.seat;
     if (rs.done[seat] || rs.taps[seat].has(index)) return;
     rs.taps[seat].add(index);
-    const hit = deriveBoard(rs.spec, rs.seed).required.has(index);
+    const required = deriveBoard(rs.spec, rs.seed).required;
+    const hit = required.has(index);
     if (hit) rs.hits[seat]++; else rs.misses[seat]++;
-    this.broadcastExcept(match, player.id, { t: "opp", r: rs.round, i: index, k: hit ? "ok" : "miss", s: rs.hits[seat] + rs.misses[seat] });
-    this.send(player, { t: "fix", r: rs.round, i: index, k: hit ? "ok" : "miss" });
-    if (rs.hits[seat] >= deriveBoard(rs.spec, rs.seed).required.size) {
+    const progress = {
+      t: "opp", r: rs.round, i: index, k: hit ? "ok" : "miss",
+      s: rs.hits[seat] + rs.misses[seat], h: rs.hits[seat], m: rs.misses[seat],
+      required: required.size, score: calculateScore(rs.hits[seat], rs.misses[seat]),
+      total: match.scores[seat]
+    };
+    this.broadcastExcept(match, player.id, progress);
+    this.send(player, { t: "fix", r: rs.round, i: index, k: hit ? "ok" : "miss", h: rs.hits[seat], m: rs.misses[seat] });
+    if (rs.hits[seat] >= required.size) {
       rs.done[seat] = true;
       await this.finishRound(match.id);
     }
@@ -291,14 +303,16 @@ export class MatchMakerDO {
     match.scores[1] += score[1];
     match.rounds.push({ r: rs.round, score, hits: [...rs.hits], misses: [...rs.misses] });
     const reason = seat => rs.done[seat] ? "completed" : (rs.hits[seat] === 0 && rs.misses[seat] === 0 ? "no_attempt" : "timeout");
-    const winner = score[0] === score[1] ? null : (score[0] > score[1] ? 0 : 1);
+    const winner = score[0] === score[1] ? null : score[0] > score[1] ? 0 : 1;
     for (let seat = 0; seat < 2; seat++) {
       const p = this.players.get(match.players[seat]);
       if (!p) continue;
       this.send(p, { t: "round_end", p: {
-        r: rs.round, tot: [...match.scores], you: { score: score[seat], reason: reason(seat) },
+        r: rs.round, tot: [...match.scores], score: [...score],
+        you: { score: score[seat], reason: reason(seat) },
         opp: { score: score[1 - seat], reason: reason(1 - seat) },
-        win: winner === null ? "draw" : winner === seat ? "you" : "opp", final: rs.round === TOTAL_ROUNDS, now: Date.now()
+        win: winner === null ? "draw" : winner === seat ? "you" : "opp",
+        final: rs.round === TOTAL_ROUNDS, now: Date.now(), players: this.matchProfiles(match)
       }});
     }
     if (rs.round === TOTAL_ROUNDS) {
@@ -312,12 +326,9 @@ export class MatchMakerDO {
     match.nextRoundAt = nextRoundAt;
     this.broadcast(match, {
       t: "next_round", r: rs.round, next: rs.round + 1, rounds: TOTAL_ROUNDS,
-      score: [...score], tot: [...match.scores],
+      score: [...score], tot: [...match.scores], nextRoundAt, now: Date.now(),
       win: [winner === null ? "draw" : winner === 0 ? "you" : "opp", winner === null ? "draw" : winner === 1 ? "you" : "opp"],
-      nextRoundAt, now: Date.now(), players: match.players.map((id, i) => ({
-        id, nick: match.nicks[i], cc: match.ccs[i], av: match.avatars[i], connected: !!this.players.get(id)?.connected,
-        score: score[i], total: match.scores[i]
-      }))
+      players: this.matchProfiles(match)
     });
     setTimeout(() => {
       const current = this.matches.get(match.id);
@@ -330,10 +341,13 @@ export class MatchMakerDO {
     const match = this.matches.get(matchId);
     if (!match || match.state === "ended") return;
     match.state = "ended";
-    const winner = match.scores[0] === match.scores[1] ? null : (match.scores[0] > match.scores[1] ? 0 : 1);
+    const winner = match.scores[0] === match.scores[1] ? null : match.scores[0] > match.scores[1] ? 0 : 1;
     for (let seat = 0; seat < 2; seat++) {
       const p = this.players.get(match.players[seat]);
-      if (p) this.send(p, { t: "match_end", p: { win: winner === null ? "draw" : winner === seat ? "you" : "opp", tot: [...match.scores], rounds: match.rounds, reason: "completed", now: Date.now() } });
+      if (p) this.send(p, { t: "match_end", p: {
+        win: winner === null ? "draw" : winner === seat ? "you" : "opp",
+        tot: [...match.scores], rounds: match.rounds, reason: "completed", now: Date.now(), players: this.matchProfiles(match)
+      }});
     }
     await this.save();
     setTimeout(async () => {
@@ -365,8 +379,7 @@ export class MatchMakerDO {
     setTimeout(async () => {
       const m = this.matches.get(match.id);
       if (!m || !m.disconnected.has(seat)) return;
-      const current = this.players.get(player.id);
-      if (current?.connected) return;
+      if (this.players.get(player.id)?.connected) return;
       const other = this.players.get(m.players[1 - seat]);
       if (other) {
         this.send(other, { t: "opp_left", final: true });
@@ -399,10 +412,11 @@ export class MatchMakerDO {
     this.send(oldPlayer, { t: "resume_ok", m: match.id, you: seat,
       opp: { nick: match.nicks[1 - seat], cc: match.ccs[1 - seat], av: match.avatars[1 - seat] },
       rounds: TOTAL_ROUNDS, tot: [...match.scores], r: match.round, st: match.state,
-      nextRoundAt: match.state === "next_round" ? match.nextRoundAt : null, now: Date.now(),
+      nextRoundAt: match.state === "next_round" ? match.nextRoundAt : null, now: Date.now(), players: this.matchProfiles(match),
       rs: rs ? { r: rs.round, spec: rs.spec, seed: rs.seed, reveal: rs.spec.reveal, recall: rs.spec.recall,
         startedAt: rs.startedAt, endsAt: rs.deadline, roundStartAt: rs.roundStartAt, roundEndAt: rs.roundEndAt,
-        yourTaps: [...rs.taps[seat]], yourHits: rs.hits[seat], yourMisses: rs.misses[seat], yourDone: rs.done[seat] } : null
+        yourTaps: [...rs.taps[seat]], yourHits: rs.hits[seat], yourMisses: rs.misses[seat], yourDone: rs.done[seat],
+        opponentHits: rs.hits[1 - seat], opponentMisses: rs.misses[1 - seat], required: deriveBoard(rs.spec, rs.seed).required.size } : null
     });
     const opponent = this.players.get(match.players[1 - seat]);
     if (opponent) this.send(opponent, { t: "opp_back" });
@@ -456,7 +470,13 @@ function rng(seed) {
 
 function createRoundSpec(round) {
   const size = Math.min(3 + round, 7);
-  return { size, reveal: Math.max(900, 1800 - round * 120), recall: Math.max(2500, 6000 - round * 400), count: Math.min(2 + round, Math.floor(size * size * 0.45)), round };
+  return {
+    size,
+    reveal: Math.max(900, 1800 - round * 120),
+    recall: Math.max(2500, 6000 - round * 400),
+    count: Math.min(2 + round, Math.floor(size * size * 0.45)),
+    round
+  };
 }
 
 function deriveBoard(spec, seed) {
