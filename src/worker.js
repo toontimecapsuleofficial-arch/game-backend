@@ -1,114 +1,97 @@
 // Memory Matrix — Cloudflare Worker + Durable Object
-// Automatic matchmaking + realtime multiplayer
-// No room IDs / invite codes required.
+// Automatic matchmaking + realtime multiplayer.
+// Match IDs are internal protocol identifiers only; there is no room-code UI.
 
 const MAX_PLAYERS_PER_MATCH = 2;
-const TOTAL_ROUNDS = 3; // server-authoritative: exactly 3 rounds per match, never 2 or 4
-const QUEUE_TIMEOUT = 60_000;
+const TOTAL_ROUNDS = 3;
 const RECONNECT_GRACE = 15_000;
 const ROUND_TIME = 15_000;
-const NEXT_ROUND_DELAY = 5_000; // authoritative NEXT_ROUND_5_SEC transition duration
-const FINAL_RESULT_DELAY = 1_500; // small pause before match_end so round_end/final renders
+const NEXT_ROUND_DELAY = 5_000;
+const FINAL_RESULT_DELAY = 1_500;
 
-// --- Profile validation defaults (added) ---
 const DEFAULT_NICK = "Player";
 const DEFAULT_CC = "XX";
 const NICK_MAX_LEN = 16;
 const CC_REGEX = /^[A-Za-z]{2}$/;
+const MP_AVATARS = [
+  "brain", "cube", "robot", "fox", "penguin", "bolt", "owl",
+  "cat", "dragon", "astro", "ninja"
+];
 
 function sanitizeNick(raw) {
   if (typeof raw !== "string") return DEFAULT_NICK;
-  let cleaned = raw.replace(/[^\p{L}\p{N}\s_\-.]/gu, "").trim();
-  if (!cleaned) return DEFAULT_NICK;
-  if (cleaned.length > NICK_MAX_LEN) cleaned = cleaned.slice(0, NICK_MAX_LEN);
-  return cleaned;
+  let value = raw.replace(/[^\p{L}\p{N}\s_\-.]/gu, "").trim();
+  if (!value) return DEFAULT_NICK;
+  return value.slice(0, NICK_MAX_LEN);
 }
 
 function sanitizeCC(raw) {
   if (typeof raw !== "string") return DEFAULT_CC;
-  const trimmed = raw.trim().toUpperCase();
-  return CC_REGEX.test(trimmed) ? trimmed : DEFAULT_CC;
+  const value = raw.trim().toUpperCase();
+  return CC_REGEX.test(value) ? value : DEFAULT_CC;
+}
+
+function validMessage(msg) {
+  return msg && typeof msg === "object" && !Array.isArray(msg) &&
+    typeof msg.t === "string" && msg.t.length <= 32;
+}
+
+function validRoundNumber(value) {
+  return Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= TOTAL_ROUNDS;
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    // Health check
     if (url.pathname === "/health") {
-      const id = env.MATCHMAKER.idFromName("global");
-      const stub = env.MATCHMAKER.get(id);
-
-      const res = await stub.fetch(
-        new Request("https://internal/status")
-      );
-
-      return new Response(await res.text(), {
-        status: res.status,
-        headers: {
-          "content-type": "application/json",
-          "access-control-allow-origin": "*"
-        }
+      const stub = env.MATCHMAKER.get(env.MATCHMAKER.idFromName("global"));
+      const response = await stub.fetch(new Request("https://internal/status"));
+      return new Response(await response.text(), {
+        status: response.status,
+        headers: { "content-type": "application/json", "access-control-allow-origin": "*" }
       });
     }
-
-    // WebSocket endpoint
     if (url.pathname === "/ws") {
-      if (request.headers.get("Upgrade") !== "websocket") {
-        return new Response("WebSocket upgrade required", {
-          status: 426
-        });
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("WebSocket upgrade required", { status: 426 });
       }
-
-      const id = env.MATCHMAKER.idFromName("global");
-      const stub = env.MATCHMAKER.get(id);
-
+      const stub = env.MATCHMAKER.get(env.MATCHMAKER.idFromName("global"));
       return stub.fetch(request);
     }
-
-    return new Response(
-      "Memory Matrix Multiplayer Backend",
-      {
-        status: 200,
-        headers: {
-          "content-type": "text/plain"
-        }
-      }
-    );
+    return new Response("Memory Matrix Multiplayer Backend", {
+      status: 200,
+      headers: { "content-type": "text/plain" }
+    });
   }
 };
 
-
-/* =========================================================
-   MATCHMAKER DURABLE OBJECT
-   ========================================================= */
-
 export class MatchMakerDO {
-
   constructor(state, env) {
     this.state = state;
     this.env = env;
-
     this.queue = [];
     this.players = new Map();
     this.matches = new Map();
-
     this.loaded = false;
   }
-
 
   async load() {
     if (this.loaded) return;
     this.loaded = true;
-
     const data = await this.state.storage.get("state");
-
     if (!data) return;
-
-    this.queue = data.queue || [];
-    this.matches = new Map(data.matches || []);
+    this.queue = Array.isArray(data.queue) ? data.queue : [];
+    this.matches = new Map(Array.isArray(data.matches) ? data.matches : []);
+    for (const match of this.matches.values()) {
+      if (!(match.disconnected instanceof Map)) match.disconnected = new Map();
+      // Backward-compatible defaults for matches persisted by older versions.
+      match.nicks ||= [DEFAULT_NICK, DEFAULT_NICK];
+      match.ccs ||= [DEFAULT_CC, DEFAULT_CC];
+      match.avatars ||= ["brain", "brain"];
+      match.round ||= 0;
+      match.nextRoundAt ??= null;
+    }
   }
-
 
   async save() {
     await this.state.storage.put("state", {
@@ -117,2080 +100,375 @@ export class MatchMakerDO {
     });
   }
 
-
   async fetch(request) {
-
     await this.load();
-
     const url = new URL(request.url);
-
     if (url.pathname === "/status") {
-      return new Response(
-        JSON.stringify({
-          ok: true,
-          queue: this.queue.length,
-          rooms: this.matches.size,
-          players: this.players.size
-        }),
-        {
-          headers: {
-            "content-type": "application/json"
-          }
-        }
-      );
+      return new Response(JSON.stringify({
+        ok: true, queue: this.queue.length, rooms: this.matches.size, players: this.players.size
+      }), { headers: { "content-type": "application/json" } });
     }
-
-
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("WebSocket endpoint", {
-        status: 200
-      });
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("WebSocket endpoint", { status: 200 });
     }
-
 
     const pair = new WebSocketPair();
-
     const client = pair[0];
-    const server = pair[1];
-
-    server.accept();
-
-    const playerId =
-      crypto.randomUUID();
-
+    const socket = pair[1];
+    socket.accept();
     const player = {
-      id: playerId,
-      ws: server,
-      avatar: "brain",
-      nick: DEFAULT_NICK,
-      cc: DEFAULT_CC,
-      matchId: null,
-      seat: null,
-      connected: true,
-      joinedAt: Date.now()
+      id: crypto.randomUUID(), ws: socket, avatar: "brain", nick: DEFAULT_NICK,
+      cc: DEFAULT_CC, matchId: null, seat: null, connected: true, joinedAt: Date.now()
     };
+    this.players.set(player.id, player);
 
-    this.players.set(playerId, player);
-
-
-    server.addEventListener(
-      "message",
-      async event => {
-
-        try {
-
-          const msg =
-            typeof event.data === "string"
-              ? JSON.parse(event.data)
-              : event.data;
-
-          await this.handleMessage(
-            player,
-            msg
-          );
-
-        } catch (err) {
-
-          this.send(
-            player,
-            {
-              t: "error",
-              code: "BAD_MESSAGE",
-              message: "Invalid message"
-            }
-          );
-
-        }
-
+    socket.addEventListener("message", async event => {
+      try {
+        const msg = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+        if (!validMessage(msg)) throw new Error("invalid message");
+        await this.handleMessage(player, msg);
+      } catch {
+        this.send(player, { t: "error", code: "BAD_MESSAGE", message: "Invalid message" });
       }
-    );
-
-
-    server.addEventListener(
-      "close",
-      async () => {
-
-        player.connected = false;
-
-        await this.handleDisconnect(
-          player
-        );
-
-      }
-    );
-
-
-    server.addEventListener(
-      "error",
-      async () => {
-
-        player.connected = false;
-
-        await this.handleDisconnect(
-          player
-        );
-
-      }
-    );
-
-
-    this.send(
-      player,
-      {
-        t: "ready",
-        pid: playerId
-      }
-    );
-
-
-    return new Response(null, {
-      status: 101,
-      webSocket: client
     });
+    const disconnect = async () => {
+      if (!player.connected) return;
+      player.connected = false;
+      await this.handleDisconnect(player);
+    };
+    socket.addEventListener("close", disconnect);
+    socket.addEventListener("error", disconnect);
+    this.send(player, { t: "ready", pid: player.id });
+    return new Response(null, { status: 101, webSocket: client });
   }
-
-
-  /* =======================================================
-     MESSAGE ROUTER
-     ======================================================= */
 
   async handleMessage(player, msg) {
-
-    if (!msg || typeof msg.t !== "string")
-      return;
-
-
     switch (msg.t) {
-
-      case "queue":
-        await this.joinQueue(
-          player,
-          msg
-        );
-        break;
-
-
-      case "leave_queue":
-        await this.leaveQueue(player);
-        break;
-
-
+      case "queue": return this.joinQueue(player, msg);
+      case "leave_queue": return this.leaveQueue(player);
       case "ping":
-        this.send(
-          player,
-          {
-            t: "pong",
-            now: Date.now(),
-            // Echo the client's send time (if provided) so the
-            // client can compute round-trip time and a clock
-            // offset: offset = now - (echoedAt + rtt/2).
-            echo:
-              typeof msg.now !==
-              "undefined"
-                ? msg.now
-                : null
-          }
-        );
-        break;
-
-
-      case "tap":
-        await this.handleTap(
-          player,
-          msg
-        );
-        break;
-
-
-      case "round_done":
-        await this.handleRoundDone(
-          player,
-          msg
-        );
-        break;
-
-
-      case "resume":
-        await this.handleResume(
-          player,
-          msg
-        );
-        break;
-
-
-      case "leave":
-        await this.leaveMatch(
-          player
-        );
-        break;
-
+        this.send(player, { t: "pong", now: Date.now(), echo: msg.now ?? null });
+        return;
+      case "tap": return this.handleTap(player, msg);
+      case "round_done": return this.handleRoundDone(player, msg);
+      case "resume": return this.handleResume(player, msg);
+      case "leave": return this.leaveMatch(player);
+      default: return;
     }
   }
-
-
-  /* =======================================================
-     MATCHMAKING
-     ======================================================= */
 
   async joinQueue(player, msg) {
-
-    // Prevent duplicate queueing
-    if (
-      this.queue.includes(player.id)
-    ) {
-      return;
-    }
-
-
+    if (this.queue.includes(player.id)) return;
     if (player.matchId) {
-
-      this.send(
-        player,
-        {
-          t: "error",
-          code: "ALREADY_IN_MATCH"
-        }
-      );
-
+      this.send(player, { t: "error", code: "ALREADY_IN_MATCH" });
       return;
     }
-
-
-    player.avatar =
-      MP_AVATARS.includes(msg.av)
-        ? msg.av
-        : "brain";
-
-
-    // Safely receive nick + cc from "queue" message (added)
-    player.nick =
-      sanitizeNick(msg.nick);
-
-    player.cc =
-      sanitizeCC(msg.cc);
-
-
-    player.joinedAt =
-      Date.now();
-
-
-    this.queue.push(
-      player.id
-    );
-
-
-    this.send(
-      player,
-      {
-        t: "queued",
-        pos: this.queue.length
-      }
-    );
-
-
+    player.avatar = MP_AVATARS.includes(msg.av) ? msg.av : "brain";
+    player.nick = sanitizeNick(msg.nick);
+    player.cc = sanitizeCC(msg.cc);
+    player.joinedAt = Date.now();
+    this.queue.push(player.id);
+    this.send(player, { t: "queued", pos: this.queue.length });
     await this.tryMatch();
-
     await this.save();
   }
-
 
   async leaveQueue(player) {
-
-    const i =
-      this.queue.indexOf(
-        player.id
-      );
-
-    if (i !== -1) {
-
-      this.queue.splice(
-        i,
-        1
-      );
-
-    }
-
-
-    this.send(
-      player,
-      {
-        t: "queue_left"
-      }
-    );
-
-
+    this.queue = this.queue.filter(id => id !== player.id);
+    this.send(player, { t: "queue_left" });
     await this.save();
   }
-
 
   async tryMatch() {
-
-    // Remove disconnected players
-    this.queue =
-      this.queue.filter(
-        id => {
-
-          const p =
-            this.players.get(id);
-
-          return (
-            p &&
-            p.connected &&
-            !p.matchId
-          );
-
-        }
-      );
-
-
-    while (
-      this.queue.length >=
-      MAX_PLAYERS_PER_MATCH
-    ) {
-
-      const aId =
-        this.queue.shift();
-
-      const bId =
-        this.queue.shift();
-
-
-      const a =
-        this.players.get(aId);
-
-      const b =
-        this.players.get(bId);
-
-
-      if (
-        !a ||
-        !b ||
-        !a.connected ||
-        !b.connected
-      ) {
-        continue;
-      }
-
-
-      await this.createMatch(
-        a,
-        b
-      );
+    this.queue = this.queue.filter(id => {
+      const p = this.players.get(id);
+      return p && p.connected && !p.matchId;
+    });
+    while (this.queue.length >= MAX_PLAYERS_PER_MATCH) {
+      const a = this.players.get(this.queue.shift());
+      const b = this.players.get(this.queue.shift());
+      if (!a || !b || !a.connected || !b.connected) continue;
+      await this.createMatch(a, b);
     }
   }
 
-
-  /* =======================================================
-     CREATE MATCH
-     ======================================================= */
+  profile(player) {
+    return { nick: player.nick, cc: player.cc, av: player.avatar };
+  }
 
   async createMatch(a, b) {
-
-    const matchId =
-      crypto.randomUUID();
-
-
-    const seed =
-      randomSeed();
-
-
+    const matchId = crypto.randomUUID();
     const match = {
-
-      id: matchId,
-
-      seed,
-
-      players: [
-        a.id,
-        b.id
-      ],
-
-      avatars: [
-        a.avatar,
-        b.avatar
-      ],
-
-      // Stored opponent profile fields (added)
-      nicks: [
-        a.nick,
-        b.nick
-      ],
-
-      ccs: [
-        a.cc,
-        b.cc
-      ],
-
-      scores: [
-        0,
-        0
-      ],
-
-      rounds: [],
-
-      round: 0,
-
-      state: "matched",
-
-      createdAt: Date.now(),
-
-      roundState: null,
-
-      // Authoritative timestamp for the current NEXT_ROUND_5_SEC
-      // transition, if one is active; null otherwise.
-      nextRoundAt: null,
-
-      disconnected: new Map()
+      id: matchId, seed: randomSeed(), players: [a.id, b.id],
+      avatars: [a.avatar, b.avatar], nicks: [a.nick, b.nick], ccs: [a.cc, b.cc],
+      scores: [0, 0], rounds: [], round: 0, state: "matched", createdAt: Date.now(),
+      roundState: null, nextRoundAt: null, disconnected: new Map()
     };
-
-
-    this.matches.set(
-      matchId,
-      match
-    );
-
-
-    a.matchId = matchId;
-    b.matchId = matchId;
-
-    a.seat = 0;
-    b.seat = 1;
-
-
-    this.send(
-      a,
-      {
-        t: "matched",
-
-        m: matchId,
-
-        you: 0,
-
-        opp: {
-          nick: b.nick,
-          cc: b.cc,
-          av: b.avatar
-        },
-
-        rounds: TOTAL_ROUNDS,
-
-        now: Date.now()
-      }
-    );
-
-
-    this.send(
-      b,
-      {
-        t: "matched",
-
-        m: matchId,
-
-        you: 1,
-
-        opp: {
-          nick: a.nick,
-          cc: a.cc,
-          av: a.avatar
-        },
-
-        rounds: TOTAL_ROUNDS,
-
-        now: Date.now()
-      }
-    );
-
-
-    // Countdown
-    setTimeout(
-      () => {
-
-        const m =
-          this.matches.get(matchId);
-
-        if (
-          !m ||
-          m.state !== "matched"
-        )
-          return;
-
-
-        m.state =
-          "countdown";
-
-
-        this.broadcast(
-          m,
-          {
-            t: "count",
-            n: 3
-          }
-        );
-
-
-        setTimeout(
-          () => this.startRound(m),
-          3000
-        );
-
-      },
-      200
-    );
-
-
+    this.matches.set(matchId, match);
+    a.matchId = b.matchId = matchId;
+    a.seat = 0; b.seat = 1;
+    this.send(a, { t: "matched", m: matchId, you: 0, opp: this.profile(b), rounds: TOTAL_ROUNDS, now: Date.now() });
+    this.send(b, { t: "matched", m: matchId, you: 1, opp: this.profile(a), rounds: TOTAL_ROUNDS, now: Date.now() });
+    setTimeout(() => {
+      const m = this.matches.get(matchId);
+      if (!m || m.state !== "matched") return;
+      m.state = "countdown";
+      this.broadcast(m, { t: "count", n: 3 });
+      setTimeout(() => this.startRound(m), 3000);
+    }, 200);
     await this.save();
   }
-
-
-  /* =======================================================
-     ROUND CREATION
-     ======================================================= */
 
   async startRound(match) {
-
-    if (
-      !match ||
-      match.round >= TOTAL_ROUNDS ||
-      (match.state !== "countdown" &&
-        match.state !== "next_round")
-    ) {
-      return;
-    }
-
-
-    match.round++;
-
-    match.state =
-      "round";
-
-    match.nextRoundAt =
-      null;
-
-
-    const spec =
-      createRoundSpec(
-        match.round
-      );
-
-
-    const roundSeed =
-      mixSeed(
-        match.seed,
-        match.round
-      );
-
-
+    if (!match || match.round >= TOTAL_ROUNDS || !["countdown", "next_round"].includes(match.state)) return;
+    const round = match.round + 1;
+    if (round > TOTAL_ROUNDS) return;
+    const startedAt = Date.now();
+    const deadline = startedAt + ROUND_TIME;
+    const spec = createRoundSpec(round);
+    const seed = mixSeed(match.seed, round);
+    match.round = round;
+    match.state = "round";
+    match.nextRoundAt = null;
     match.roundState = {
-
-      round:
-        match.round,
-
-      spec,
-
-      seed:
-        roundSeed,
-
-      startedAt:
-        Date.now(),
-
-      deadline:
-        Date.now() + ROUND_TIME,
-
-      taps: [
-        new Set(),
-        new Set()
-      ],
-
-      hits: [
-        0,
-        0
-      ],
-
-      misses: [
-        0,
-        0
-      ],
-
-      done: [
-        false,
-        false
-      ]
-
+      round, spec, seed, startedAt, deadline,
+      roundStartAt: startedAt, roundEndAt: deadline,
+      taps: [new Set(), new Set()], hits: [0, 0], misses: [0, 0], done: [false, false]
     };
-
-
-    this.broadcast(
-      match,
-      {
-        t: "round",
-
-        r: match.round,
-
-        spec,
-
-        seed: roundSeed,
-
-        reveal: spec.reveal,
-
-        recall: spec.recall,
-
-        // Legacy duration field (kept for compatibility).
-        deadline:
-          ROUND_TIME,
-
-        // Server-authoritative absolute timestamps (ms, epoch).
-        // Both players resolve remaining time from the SAME
-        // startedAt/endsAt pair instead of starting an independent
-        // local timer on message-receipt, which is what caused
-        // players to see different remaining time under latency.
-        startedAt:
-          match.roundState.startedAt,
-
-        endsAt:
-          match.roundState.deadline,
-
-        // Server clock at send time, so the client can measure its
-        // own clock offset (offset = now - Date.now() on receipt)
-        // and apply that offset when computing remaining time.
-        now:
-          Date.now()
-      }
-    );
-
-
-    // Server-owned round timer
-    setTimeout(
-      () => {
-
-        this.finishRound(
-          match.id
-        );
-
-      },
-      ROUND_TIME + 100
-    );
+    this.broadcast(match, {
+      t: "round", r: round, spec, seed, reveal: spec.reveal, recall: spec.recall,
+      deadline: ROUND_TIME, startedAt, endsAt: deadline, roundStartAt: startedAt,
+      roundEndAt: deadline, now: Date.now()
+    });
+    setTimeout(() => this.finishRound(match.id), ROUND_TIME + 100);
+    await this.save();
   }
-
-
-  /* =======================================================
-     TAP VALIDATION
-     ======================================================= */
 
   async handleTap(player, msg) {
-
-    if (!player.matchId)
-      return;
-
-
-    const match =
-      this.matches.get(
-        player.matchId
-      );
-
-
-    if (!match)
-      return;
-
-
-    const rs =
-      match.roundState;
-
-
-    if (
-      !rs ||
-      match.state !== "round" ||
-      typeof player.seat !== "number"
-    )
-      return;
-
-
-    if (
-      Date.now() >
-      rs.deadline
-    ) {
-
-      this.send(
-        player,
-        {
-          t: "fix",
-          r: rs.round,
-          i: msg.i
-        }
-      );
-
+    const match = player.matchId && this.matches.get(player.matchId);
+    const rs = match?.roundState;
+    if (!match || !rs || match.state !== "round" || !Number.isInteger(player.seat)) return;
+    if (!validRoundNumber(msg.r) || Number(msg.r) !== rs.round || Date.now() > rs.roundEndAt) {
+      this.send(player, { t: "fix", r: rs.round, i: msg.i });
       return;
     }
-
-
-    if (
-      Number(msg.r) !== rs.round
-    )
-      return;
-
-
-    const index =
-      Number(msg.i);
-
-
-    const size =
-      rs.spec.size;
-
-
-    if (
-      !Number.isInteger(index) ||
-      index < 0 ||
-      index >= size * size
-    ) {
-
-      this.send(
-        player,
-        {
-          t: "fix",
-          r: rs.round,
-          i: index
-        }
-      );
-
+    const index = Number(msg.i);
+    const size = rs.spec.size;
+    if (!Number.isInteger(index) || index < 0 || index >= size * size) {
+      this.send(player, { t: "fix", r: rs.round, i: index });
       return;
     }
-
-
-    const seat =
-      player.seat;
-
-
-    // Ignore any action from a seat that has already completed
-    // (found all required tiles / submitted round_done) this round.
-    if (
-      rs.done[seat]
-    ) {
-      return;
-    }
-
-
-    // Ignore duplicate taps
-    if (
-      rs.taps[seat].has(index)
-    ) {
-      return;
-    }
-
-
-    rs.taps[seat].add(
-      index
-    );
-
-
-    const board =
-      deriveBoard(
-        rs.spec,
-        rs.seed
-      );
-
-
-    const isHit =
-      board.required.has(index);
-
-
-    if (isHit) {
-
-      rs.hits[seat]++;
-
-    } else {
-
-      rs.misses[seat]++;
-
-    }
-
-
-    // Relay opponent event
-    this.broadcastExcept(
-      match,
-      player.id,
-      {
-        t: "opp",
-
-        r: rs.round,
-
-        i: index,
-
-        k:
-          isHit
-            ? "ok"
-            : "miss",
-
-        s:
-          rs.hits[seat] +
-          rs.misses[seat]
-      }
-    );
-
-
-    // Inform player of corrected result
-    this.send(
-      player,
-      {
-        t: "fix",
-
-        r: rs.round,
-
-        i: index,
-
-        k:
-          isHit
-            ? "ok"
-            : "miss"
-      }
-    );
-
-
-    // Finish automatically when all required tiles found
-    if (
-      rs.hits[seat] >=
-      board.required.size
-    ) {
-
-      rs.done[seat] =
-        true;
-
-      await this.finishRound(
-        match.id
-      );
+    const seat = player.seat;
+    if (rs.done[seat] || rs.taps[seat].has(index)) return;
+    rs.taps[seat].add(index);
+    const hit = deriveBoard(rs.spec, rs.seed).required.has(index);
+    if (hit) rs.hits[seat]++; else rs.misses[seat]++;
+    this.broadcastExcept(match, player.id, { t: "opp", r: rs.round, i: index, k: hit ? "ok" : "miss", s: rs.hits[seat] + rs.misses[seat] });
+    this.send(player, { t: "fix", r: rs.round, i: index, k: hit ? "ok" : "miss" });
+    if (rs.hits[seat] >= deriveBoard(rs.spec, rs.seed).required.size) {
+      rs.done[seat] = true;
+      await this.finishRound(match.id);
     }
   }
 
-
-  /* =======================================================
-     ROUND DONE
-     ======================================================= */
-
-  async handleRoundDone(
-    player,
-    msg
-  ) {
-
-    if (!player.matchId)
-      return;
-
-
-    const match =
-      this.matches.get(
-        player.matchId
-      );
-
-
-    if (!match)
-      return;
-
-
-    const rs =
-      match.roundState;
-
-
-    // Only accept round_done while the round named by the message is
-    // still the ACTIVE round (match.state === "round"). This rejects
-    // stale/duplicate/late messages from a round that has already
-    // ended, been superseded by a transition, or not started yet.
-    if (
-      !rs ||
-      match.state !== "round" ||
-      typeof player.seat !== "number"
-    )
-      return;
-
-
-    if (
-      Number(msg.r) !== rs.round
-    )
-      return;
-
-
-    // Reject anything arriving after the server's own deadline, even
-    // if it slips in before the timer callback fires.
-    if (
-      Date.now() >
-      rs.deadline
-    )
-      return;
-
-
-    // Ignore duplicate round_done for a seat that already finished.
-    if (
-      rs.done[player.seat]
-    )
-      return;
-
-
-    const board =
-      deriveBoard(
-        rs.spec,
-        rs.seed
-      );
-
-
-    // Only accept "done" if player actually
-    // found every required tile.
-    if (
-      rs.hits[player.seat] <
-      board.required.size
-    ) {
-
-      return;
-    }
-
-
-    rs.done[player.seat] =
-      true;
-
-
-    await this.finishRound(
-      match.id
-    );
+  async handleRoundDone(player, msg) {
+    const match = player.matchId && this.matches.get(player.matchId);
+    const rs = match?.roundState;
+    if (!match || !rs || match.state !== "round" || !Number.isInteger(player.seat)) return;
+    if (!validRoundNumber(msg.r) || Number(msg.r) !== rs.round || Date.now() > rs.roundEndAt || rs.done[player.seat]) return;
+    if (rs.hits[player.seat] < deriveBoard(rs.spec, rs.seed).required.size) return;
+    rs.done[player.seat] = true;
+    await this.finishRound(match.id);
   }
-
-
-  /* =======================================================
-     FINISH ROUND
-     ======================================================= */
 
   async finishRound(matchId) {
-
-    const match =
-      this.matches.get(
-        matchId
-      );
-
-
-    if (!match)
-      return;
-
-
-    const rs =
-      match.roundState;
-
-
-    if (
-      !rs ||
-      match.state !== "round"
-    )
-      return;
-
-
-    match.state =
-      "round_end";
-
-
-    const scoreA =
-      calculateScore(
-        rs.hits[0],
-        rs.misses[0],
-        rs.spec
-      );
-
-
-    const scoreB =
-      calculateScore(
-        rs.hits[1],
-        rs.misses[1],
-        rs.spec
-      );
-
-
-    match.scores[0] +=
-      scoreA;
-
-
-    match.scores[1] +=
-      scoreB;
-
-
-    match.rounds.push({
-
-      r: rs.round,
-
-      score: [
-        scoreA,
-        scoreB
-      ],
-
-      hits: [
-        rs.hits[0],
-        rs.hits[1]
-      ],
-
-      misses: [
-        rs.misses[0],
-        rs.misses[1]
-      ]
-
-    });
-
-
-    // Per-seat round reason (added).
-    // Assumption: "completed" = found all required tiles,
-    // "no_attempt" = zero taps registered, otherwise "timeout".
-    const roundReason = seat => {
-      if (rs.done[seat]) return "completed";
-      if (rs.hits[seat] === 0 && rs.misses[seat] === 0) return "no_attempt";
-      return "timeout";
-    };
-
-    const reasonA = roundReason(0);
-    const reasonB = roundReason(1);
-
-    const totNow = [
-      match.scores[0],
-      match.scores[1]
-    ];
-
-    const isFinalRound =
-      match.round >= TOTAL_ROUNDS;
-
-    // Per-seat round winner/tie status ("you"/"opp"/"draw" from each
-    // player's own perspective), derived only from server-computed
-    // round scores — never from anything the client sent.
-    let roundWinnerSeat = null; // 0, 1, or null for a tie
-    if (scoreA > scoreB) roundWinnerSeat = 0;
-    else if (scoreB > scoreA) roundWinnerSeat = 1;
-
-    const roundWinnerFor = seat => {
-      if (roundWinnerSeat === null) return "draw";
-      return roundWinnerSeat === seat ? "you" : "opp";
-    };
-
-    // round_end payload wrapped in "p" for mpRoundEnd(m) compatibility.
-    // Each player receives their own "you"/"opp" perspective.
+    const match = this.matches.get(matchId);
+    const rs = match?.roundState;
+    if (!match || !rs || match.state !== "round") return;
+    match.state = "round_end";
+    const score = [calculateScore(rs.hits[0], rs.misses[0]), calculateScore(rs.hits[1], rs.misses[1])];
+    match.scores[0] += score[0];
+    match.scores[1] += score[1];
+    match.rounds.push({ r: rs.round, score, hits: [...rs.hits], misses: [...rs.misses] });
+    const reason = seat => rs.done[seat] ? "completed" : (rs.hits[seat] === 0 && rs.misses[seat] === 0 ? "no_attempt" : "timeout");
+    const winner = score[0] === score[1] ? null : (score[0] > score[1] ? 0 : 1);
     for (let seat = 0; seat < 2; seat++) {
-
-      const p =
-        this.players.get(
-          match.players[seat]
-        );
-
+      const p = this.players.get(match.players[seat]);
       if (!p) continue;
-
-      const youScore = seat === 0 ? scoreA : scoreB;
-      const oppScore = seat === 0 ? scoreB : scoreA;
-      const youReason = seat === 0 ? reasonA : reasonB;
-      const oppReason = seat === 0 ? reasonB : reasonA;
-
-      this.send(
-        p,
-        {
-          t: "round_end",
-
-          p: {
-            r: rs.round,
-
-            tot: totNow,
-
-            you: {
-              score: youScore,
-              reason: youReason
-            },
-
-            opp: {
-              score: oppScore,
-              reason: oppReason
-            },
-
-            win:
-              roundWinnerFor(seat),
-
-            final:
-              isFinalRound,
-
-            now: Date.now()
-          }
-        }
-      );
+      this.send(p, { t: "round_end", p: {
+        r: rs.round, tot: [...match.scores], you: { score: score[seat], reason: reason(seat) },
+        opp: { score: score[1 - seat], reason: reason(1 - seat) },
+        win: winner === null ? "draw" : winner === seat ? "you" : "opp", final: rs.round === TOTAL_ROUNDS, now: Date.now()
+      }});
     }
-
-
-    if (isFinalRound) {
-
-      // ROUND_3_RESULT -> FINAL_RESULT -> FINISHED. No transition
-      // window after the last round; go straight to the final match
-      // result once the round_end above has had a moment to render.
-      match.state =
-        "final";
-
-      setTimeout(
-        () =>
-          this.finishMatch(match.id),
-        FINAL_RESULT_DELAY
-      );
-
-    } else {
-
-      // ROUND_N_RESULT -> NEXT_ROUND_5_SEC -> ROUND_N+1.
-      // The transition itself is a real, server-tracked state (not
-      // just a client animation): both clients render their local
-      // 5-second countdown from the SAME server timestamp, and the
-      // server — not either client — is what actually starts the
-      // next round when the timer elapses.
-      match.state =
-        "next_round";
-
-      const nextRound =
-        match.round + 1;
-
-      const nextRoundAt =
-        Date.now() + NEXT_ROUND_DELAY;
-
-      match.nextRoundAt =
-        nextRoundAt;
-
-      this.broadcast(
-        match,
-        {
-          t: "next_round",
-
-          r: rs.round,
-
-          next: nextRound,
-
-          rounds: TOTAL_ROUNDS,
-
-          tot: totNow,
-
-          score: [
-            scoreA,
-            scoreB
-          ],
-
-          win: [
-            roundWinnerFor(0),
-            roundWinnerFor(1)
-          ],
-
-          nextRoundAt,
-
-          now: Date.now()
-        }
-      );
-
-      setTimeout(
-        () => {
-
-          const m =
-            this.matches.get(
-              match.id
-            );
-
-          // Only proceed if the match is still alive and still
-          // waiting on THIS transition (guards against a leftover
-          // timer firing after a disconnect/leave tore the match
-          // down or replaced the transition some other way).
-          if (
-            !m ||
-            m.state !== "next_round" ||
-            m.nextRoundAt !== nextRoundAt
-          )
-            return;
-
-          this.startRound(m);
-
-        },
-        NEXT_ROUND_DELAY
-      );
+    if (rs.round === TOTAL_ROUNDS) {
+      match.state = "final";
+      await this.save();
+      setTimeout(() => this.finishMatch(match.id), FINAL_RESULT_DELAY);
+      return;
     }
-
-
+    match.state = "next_round";
+    const nextRoundAt = Date.now() + NEXT_ROUND_DELAY;
+    match.nextRoundAt = nextRoundAt;
+    this.broadcast(match, {
+      t: "next_round", r: rs.round, next: rs.round + 1, rounds: TOTAL_ROUNDS,
+      score: [...score], tot: [...match.scores],
+      win: [winner === null ? "draw" : winner === 0 ? "you" : "opp", winner === null ? "draw" : winner === 1 ? "you" : "opp"],
+      nextRoundAt, now: Date.now(), players: match.players.map((id, i) => ({
+        id, nick: match.nicks[i], cc: match.ccs[i], av: match.avatars[i], connected: !!this.players.get(id)?.connected,
+        score: score[i], total: match.scores[i]
+      }))
+    });
+    setTimeout(() => {
+      const current = this.matches.get(match.id);
+      if (current && current.state === "next_round" && current.nextRoundAt === nextRoundAt) this.startRound(current);
+    }, NEXT_ROUND_DELAY);
     await this.save();
   }
-
-
-  /* =======================================================
-     MATCH END
-     ======================================================= */
 
   async finishMatch(matchId) {
-
-    const match =
-      this.matches.get(
-        matchId
-      );
-
-
-    if (!match)
-      return;
-
-
-    match.state =
-      "ended";
-
-
-    const a =
-      match.scores[0];
-
-
-    const b =
-      match.scores[1];
-
-
-    let winner =
-      "draw";
-
-
-    if (a > b)
-      winner = "you";
-
-    if (b > a)
-      winner = "opp";
-
-
-    for (
-      let seat = 0;
-      seat < 2;
-      seat++
-    ) {
-
-      const p =
-        this.players.get(
-          match.players[seat]
-        );
-
-
-      if (!p)
-        continue;
-
-
-      let win =
-        winner;
-
-
-      if (winner !== "draw") {
-
-        win =
-          winner ===
-          (seat === 0
-            ? "you"
-            : "opp")
-            ? "you"
-            : "opp";
-      }
-
-
-      this.send(
-        p,
-        {
-          t: "match_end",
-
-          p: {
-            win,
-
-            tot: [
-              a,
-              b
-            ],
-
-            rounds:
-              match.rounds,
-
-            reason:
-              "completed",
-
-            now: Date.now()
-          }
-        }
-      );
+    const match = this.matches.get(matchId);
+    if (!match || match.state === "ended") return;
+    match.state = "ended";
+    const winner = match.scores[0] === match.scores[1] ? null : (match.scores[0] > match.scores[1] ? 0 : 1);
+    for (let seat = 0; seat < 2; seat++) {
+      const p = this.players.get(match.players[seat]);
+      if (p) this.send(p, { t: "match_end", p: { win: winner === null ? "draw" : winner === seat ? "you" : "opp", tot: [...match.scores], rounds: match.rounds, reason: "completed", now: Date.now() } });
     }
-
-
     await this.save();
-
-
-    // Keep match briefly for reconnect/result delivery
-    setTimeout(
-      () => {
-
-        const m =
-          this.matches.get(
-            matchId
-          );
-
-        if (!m) return;
-
-
-        for (
-          const pid of m.players
-        ) {
-
-          const p =
-            this.players.get(pid);
-
-          if (
-            p &&
-            p.matchId === matchId
-          ) {
-
-            p.matchId =
-              null;
-
-            p.seat =
-              null;
-          }
-        }
-
-
-        this.matches.delete(
-          matchId
-        );
-
-
-        this.save();
-
-      },
-      30_000
-    );
+    setTimeout(async () => {
+      const m = this.matches.get(matchId);
+      if (!m) return;
+      for (const id of m.players) {
+        const p = this.players.get(id);
+        if (p && p.matchId === matchId) { p.matchId = null; p.seat = null; }
+      }
+      this.matches.delete(matchId);
+      await this.save();
+    }, 30_000);
   }
-
-
-  /* =======================================================
-     RECONNECT / RESUME
-     ======================================================= */
 
   async handleDisconnect(player) {
-
+    this.queue = this.queue.filter(id => id !== player.id);
     if (!player.matchId) {
-
-      this.queue =
-        this.queue.filter(
-          id =>
-            id !== player.id
-        );
-
-      this.players.delete(
-        player.id
-      );
-
+      this.players.delete(player.id);
       await this.save();
-
       return;
     }
-
-
-    const match =
-      this.matches.get(
-        player.matchId
-      );
-
-
-    if (!match) {
-
-      this.players.delete(
-        player.id
-      );
-
-      return;
-    }
-
-
-    match.disconnected.set(
-      player.seat,
-      Date.now()
-    );
-
-
-    const opponent =
-      this.players.get(
-        match.players[
-          player.seat === 0
-            ? 1
-            : 0
-        ]
-      );
-
-
-    if (opponent) {
-
-      this.send(
-        opponent,
-        {
-          t: "opp_left"
-        }
-      );
-    }
-
-
-    setTimeout(
-      async () => {
-
-        const m =
-          this.matches.get(
-            match.id
-          );
-
-        if (!m) return;
-
-
-        const lostAt =
-          m.disconnected.get(
-            player.seat
-          );
-
-
-        if (!lostAt) return;
-
-
-        const current =
-          this.players.get(
-            player.id
-          );
-
-
-        if (
-          current &&
-          current.connected
-        ) {
-          return;
-        }
-
-
-        // Player permanently left
-        const otherSeat =
-          player.seat === 0
-            ? 1
-            : 0;
-
-
-        const other =
-          this.players.get(
-            m.players[
-              otherSeat
-            ]
-          );
-
-
-        if (other) {
-
-          this.send(
-            other,
-            {
-              t: "opp_left",
-
-              final: true
-            }
-          );
-
-
-          this.send(
-            other,
-            {
-              t: "match_end",
-
-              p: {
-                win: "you",
-
-                tot: m.scores,
-
-                rounds: m.rounds,
-
-                reason:
-                  "opponent_left"
-              }
-            }
-          );
-        }
-
-
-        m.state =
-          "ended";
-
-
-        this.matches.delete(
-          m.id
-        );
-
-        this.players.delete(
-          player.id
-        );
-
-        await this.save();
-
-      },
-      RECONNECT_GRACE
-    );
-
-
+    const match = this.matches.get(player.matchId);
+    if (!match) { this.players.delete(player.id); await this.save(); return; }
+    const seat = player.seat;
+    match.disconnected.set(seat, Date.now());
+    const opponent = this.players.get(match.players[1 - seat]);
+    if (opponent) this.send(opponent, { t: "opp_left" });
     await this.save();
-  }
-
-
-  async handleResume(
-    player,
-    msg
-  ) {
-
-    const matchId =
-      String(msg.m || "");
-
-
-    const pid =
-      String(msg.pid || "");
-
-
-    const match =
-      this.matches.get(
-        matchId
-      );
-
-
-    if (!match) {
-
-      this.send(
-        player,
-        {
-          t: "resume_fail"
-        }
-      );
-
-      return;
-    }
-
-
-    const oldPlayer =
-      this.players.get(pid);
-
-
-    if (
-      !oldPlayer ||
-      !match.players.includes(pid)
-    ) {
-
-      this.send(
-        player,
-        {
-          t: "resume_fail"
-        }
-      );
-
-      return;
-    }
-
-
-    const seat =
-      match.players.indexOf(
-        pid
-      );
-
-
-    oldPlayer.ws =
-      player.ws;
-
-    oldPlayer.connected =
-      true;
-
-    oldPlayer.matchId =
-      match.id;
-
-    oldPlayer.seat =
-      seat;
-
-
-    // Remove temporary socket identity
-    this.players.delete(
-      player.id
-    );
-
-
-    match.disconnected.delete(
-      seat
-    );
-
-
-    this.send(
-      oldPlayer,
-      {
-        t: "resume_ok",
-
-        m: match.id,
-
-        you: seat,
-
-        opp: {
-          nick:
-            match.nicks
-              ? match.nicks[
-                  seat === 0
-                    ? 1
-                    : 0
-                ]
-              : DEFAULT_NICK,
-
-          cc:
-            match.ccs
-              ? match.ccs[
-                  seat === 0
-                    ? 1
-                    : 0
-                ]
-              : DEFAULT_CC,
-
-          av:
-            match.avatars[
-              seat === 0
-                ? 1
-                : 0
-            ]
-        },
-
-        rounds:
-          TOTAL_ROUNDS,
-
-        tot:
-          match.scores,
-
-        r:
-          match.round,
-
-        st:
-          match.state,
-
-        // Present only while state === "next_round"; lets a
-        // reconnecting client rebuild the same 5-second countdown
-        // instead of guessing or restarting it locally.
-        nextRoundAt:
-          match.state === "next_round"
-            ? match.nextRoundAt
-            : null,
-
-        // Server clock at send time (clock-offset calibration).
-        now:
-          Date.now(),
-
-        // Full in-progress round state, so a reconnecting client
-        // can rebuild the exact board/timer instead of starting a
-        // fresh (and now desynced) round. Null when no round is
-        // currently active (e.g. between rounds or match ended).
-        rs:
-          match.roundState
-            ? {
-                r:
-                  match.roundState.round,
-
-                spec:
-                  match.roundState.spec,
-
-                seed:
-                  match.roundState.seed,
-
-                reveal:
-                  match.roundState.spec.reveal,
-
-                recall:
-                  match.roundState.spec.recall,
-
-                startedAt:
-                  match.roundState.startedAt,
-
-                endsAt:
-                  match.roundState.deadline,
-
-                // This player's own progress so far, so taps
-                // already made are not re-requested or duplicated.
-                yourTaps: [
-                  ...match.roundState.taps[
-                    seat
-                  ]
-                ],
-
-                yourHits:
-                  match.roundState.hits[
-                    seat
-                  ],
-
-                yourMisses:
-                  match.roundState.misses[
-                    seat
-                  ],
-
-                yourDone:
-                  match.roundState.done[
-                    seat
-                  ]
-              }
-            : null
+    setTimeout(async () => {
+      const m = this.matches.get(match.id);
+      if (!m || !m.disconnected.has(seat)) return;
+      const current = this.players.get(player.id);
+      if (current?.connected) return;
+      const other = this.players.get(m.players[1 - seat]);
+      if (other) {
+        this.send(other, { t: "opp_left", final: true });
+        this.send(other, { t: "match_end", p: { win: "you", tot: [...m.scores], rounds: m.rounds, reason: "opponent_left" } });
       }
-    );
-
-
-    const opponent =
-      this.players.get(
-        match.players[
-          seat === 0
-            ? 1
-            : 0
-        ]
-      );
-
-
-    if (opponent) {
-
-      this.send(
-        opponent,
-        {
-          t: "opp_back"
-        }
-      );
-    }
-
-
-    await this.save();
+      m.state = "ended";
+      this.matches.delete(m.id);
+      this.players.delete(player.id);
+      await this.save();
+    }, RECONNECT_GRACE);
   }
 
-
-  /* =======================================================
-     LEAVE MATCH
-     ======================================================= */
+  async handleResume(player, msg) {
+    const matchId = typeof msg.m === "string" ? msg.m : "";
+    const pid = typeof msg.pid === "string" ? msg.pid : "";
+    const match = this.matches.get(matchId);
+    const oldPlayer = this.players.get(pid);
+    if (!match || !oldPlayer || !match.players.includes(pid)) {
+      this.send(player, { t: "resume_fail" });
+      return;
+    }
+    const seat = match.players.indexOf(pid);
+    oldPlayer.ws = player.ws;
+    oldPlayer.connected = true;
+    oldPlayer.matchId = match.id;
+    oldPlayer.seat = seat;
+    this.players.delete(player.id);
+    match.disconnected.delete(seat);
+    const rs = match.roundState;
+    this.send(oldPlayer, { t: "resume_ok", m: match.id, you: seat,
+      opp: { nick: match.nicks[1 - seat], cc: match.ccs[1 - seat], av: match.avatars[1 - seat] },
+      rounds: TOTAL_ROUNDS, tot: [...match.scores], r: match.round, st: match.state,
+      nextRoundAt: match.state === "next_round" ? match.nextRoundAt : null, now: Date.now(),
+      rs: rs ? { r: rs.round, spec: rs.spec, seed: rs.seed, reveal: rs.spec.reveal, recall: rs.spec.recall,
+        startedAt: rs.startedAt, endsAt: rs.deadline, roundStartAt: rs.roundStartAt, roundEndAt: rs.roundEndAt,
+        yourTaps: [...rs.taps[seat]], yourHits: rs.hits[seat], yourMisses: rs.misses[seat], yourDone: rs.done[seat] } : null
+    });
+    const opponent = this.players.get(match.players[1 - seat]);
+    if (opponent) this.send(opponent, { t: "opp_back" });
+    await this.save();
+  }
 
   async leaveMatch(player) {
-
-    if (!player.matchId)
-      return;
-
-
-    const match =
-      this.matches.get(
-        player.matchId
-      );
-
-
-    if (!match)
-      return;
-
-
-    const otherSeat =
-      player.seat === 0
-        ? 1
-        : 0;
-
-
-    const other =
-      this.players.get(
-        match.players[
-          otherSeat
-        ]
-      );
-
-
-    if (other) {
-
-      this.send(
-        other,
-        {
-          t: "match_end",
-
-          p: {
-            win: "you",
-
-            tot:
-              match.scores,
-
-            rounds:
-              match.rounds,
-
-            reason:
-              "opponent_left"
-          }
-        }
-      );
-
-    }
-
-
-    match.state =
-      "ended";
-
-
-    this.matches.delete(
-      match.id
-    );
-
-
-    player.matchId =
-      null;
-
-
-    player.seat =
-      null;
-
-
+    const match = player.matchId && this.matches.get(player.matchId);
+    if (!match) return;
+    const other = this.players.get(match.players[1 - player.seat]);
+    if (other) this.send(other, { t: "match_end", p: { win: "you", tot: [...match.scores], rounds: match.rounds, reason: "opponent_left" } });
+    match.state = "ended";
+    this.matches.delete(match.id);
+    player.matchId = null;
+    player.seat = null;
     await this.save();
   }
 
-
-  /* =======================================================
-     SOCKET HELPERS
-     ======================================================= */
-
   send(player, data) {
-
-    if (
-      !player ||
-      !player.ws ||
-      !player.connected
-    )
-      return;
-
-
-    try {
-
-      player.ws.send(
-        JSON.stringify(data)
-      );
-
-    } catch (e) {}
+    if (!player?.ws || !player.connected) return;
+    try { player.ws.send(JSON.stringify(data)); } catch { /* socket is closing */ }
   }
-
 
   broadcast(match, data) {
-
-    for (
-      const pid of match.players
-    ) {
-
-      const p =
-        this.players.get(pid);
-
-      if (p) {
-
-        this.send(
-          p,
-          data
-        );
-
-      }
-    }
+    for (const id of match.players) this.send(this.players.get(id), data);
   }
 
-
-  broadcastExcept(
-    match,
-    exceptId,
-    data
-  ) {
-
-    for (
-      const pid of match.players
-    ) {
-
-      if (pid === exceptId)
-        continue;
-
-
-      const p =
-        this.players.get(pid);
-
-      if (p) {
-
-        this.send(
-          p,
-          data
-        );
-
-      }
-    }
+  broadcastExcept(match, exceptId, data) {
+    for (const id of match.players) if (id !== exceptId) this.send(this.players.get(id), data);
   }
 }
-
-
-/* =========================================================
-   GAME / BOARD HELPERS
-   ========================================================= */
-
-const MP_AVATARS = [
-  "brain",
-  "cube",
-  "robot",
-  "fox",
-  "penguin",
-  "bolt",
-  "owl",
-  "cat",
-  "dragon",
-  "astro",
-  "ninja"
-];
-
 
 function randomSeed() {
-
-  return Math.floor(
-    Math.random() *
-    0x7fffffff
-  );
+  return Math.floor(Math.random() * 0x7fffffff);
 }
-
 
 function mixSeed(a, b) {
-
-  let x =
-    (a ^ (
-      b * 0x45d9f3b
-    )) >>> 0;
-
-
-  x =
-    Math.imul(
-      x ^ (x >>> 16),
-      0x45d9f3b
-    ) >>> 0;
-
-
-  x ^=
-    x >>> 16;
-
-
-  return x >>> 0;
+  let x = (a ^ (b * 0x45d9f3b)) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0;
+  return (x ^ (x >>> 16)) >>> 0;
 }
-
 
 function rng(seed) {
-
-  let x =
-    seed >>> 0;
-
-
-  return function() {
-
-    x =
-      Math.imul(
-        x ^ (x >>> 16),
-        0x45d9f3b
-      ) >>> 0;
-
-    x ^=
-      x >>> 16;
-
-    return (
-      x >>> 0
-    ) / 4294967296;
+  let x = seed >>> 0;
+  return () => {
+    x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0;
+    x ^= x >>> 16;
+    return (x >>> 0) / 4294967296;
   };
 }
-
 
 function createRoundSpec(round) {
-
-  const size =
-    Math.min(
-      3 + round,
-      7
-    );
-
-
-  return {
-
-    size,
-
-    reveal:
-      Math.max(
-        900,
-        1800 -
-        round * 120
-      ),
-
-    recall:
-      Math.max(
-        2500,
-        6000 -
-        round * 400
-      ),
-
-    count:
-      Math.min(
-        2 + round,
-        Math.floor(
-          size * size * 0.45
-        )
-      ),
-
-    round
-  };
+  const size = Math.min(3 + round, 7);
+  return { size, reveal: Math.max(900, 1800 - round * 120), recall: Math.max(2500, 6000 - round * 400), count: Math.min(2 + round, Math.floor(size * size * 0.45)), round };
 }
 
-
-function deriveBoard(
-  spec,
-  seed
-) {
-
-  const total =
-    spec.size *
-    spec.size;
-
-
-  const random =
-    rng(seed);
-
-
-  const indexes =
-    Array.from(
-      {
-        length: total
-      },
-      (_, i) => i
-    );
-
-
-  // Fisher-Yates shuffle
-  for (
-    let i = total - 1;
-    i > 0;
-    i--
-  ) {
-
-    const j =
-      Math.floor(
-        random() *
-        (i + 1)
-      );
-
-
-    [
-      indexes[i],
-      indexes[j]
-    ] =
-    [
-      indexes[j],
-      indexes[i]
-    ];
+function deriveBoard(spec, seed) {
+  const indexes = Array.from({ length: spec.size * spec.size }, (_, i) => i);
+  const random = rng(seed);
+  for (let i = indexes.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [indexes[i], indexes[j]] = [indexes[j], indexes[i]];
   }
-
-
-  const required =
-    new Set(
-      indexes.slice(
-        0,
-        spec.count
-      )
-    );
-
-
-  return {
-    required
-  };
+  return { required: new Set(indexes.slice(0, spec.count)) };
 }
 
-
-function calculateScore(
-  hits,
-  misses,
-  spec
-) {
-
-  const base =
-    hits * 100;
-
-
-  const missPenalty =
-    misses * 25;
-
-
-  return Math.max(
-    0,
-    base -
-    missPenalty
-  );
-  }
+function calculateScore(hits, misses) {
+  return Math.max(0, hits * 100 - misses * 25);
+}
