@@ -1,0 +1,15 @@
+{
+  "name": "memory-matrix-mp-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker + Durable Object matchmaking/realtime backend for Memory Matrix Online Versus",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node selftest.js"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0"
+  }
+}

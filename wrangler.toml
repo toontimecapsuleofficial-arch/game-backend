@@ -1,0 +1,20 @@
+# Memory Matrix — Online Versus backend
+# Deploy:  npx wrangler deploy        (from this folder)
+# Dev:     npx wrangler dev           (WebSocket endpoint ws://localhost:8787/ws)
+name = "memory-matrix-mp"
+main = "src/worker.js"
+compatibility_date = "2025-01-15"
+
+# The whole backend is ONE Durable Object: it hosts the matchmaking queue
+# and every live match room. SQLite-backed classes are required on the
+# Workers Free plan and cost nothing extra here (no storage is written).
+[durable_objects]
+bindings = [{ name = "MATCHMAKER", class_name = "MatchMakerDO" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MatchMakerDO"]
+
+# No secrets, no vars required. The game knows this Worker's public URL
+# (configured client-side in index.html → window.MM_BACKEND). Nothing here
+# needs an API token at runtime; only YOUR wrangler login deploys it.
