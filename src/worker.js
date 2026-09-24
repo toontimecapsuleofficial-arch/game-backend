@@ -3,11 +3,11 @@
 // No room IDs / invite codes required.
 
 const MAX_PLAYERS_PER_MATCH = 2;
-const TOTAL_ROUNDS = 3;            /* exactly 3 rounds: ROUND_1 → ROUND_2 → ROUND_3 → FINAL_RESULT → FINISHED */
+const TOTAL_ROUNDS = 5;            /* exactly 3 rounds: ROUND_1 → ROUND_2 → ROUND_3 → FINAL_RESULT → FINISHED */
 const QUEUE_TIMEOUT = 60_000;
 const RECONNECT_GRACE = 15_000;
 const ROUND_TIME = 15_000;
-const TRANSITION_MS = 5_000;       /* the 5-second result transition.
+const TRANSITION_MS = 1_500;       /* the 5-second result transition.
                                       It starts ONLY AFTER ROUND_RESULT (round_end) has been
                                       computed, persisted and sent — it never delays scoring.
                                       nextRoundAt = finishTime + TRANSITION_MS (server clock). */
