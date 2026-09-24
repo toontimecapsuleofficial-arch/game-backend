@@ -1,20 +1,27 @@
-# Memory Matrix — Online Versus backend
-# Deploy:  npx wrangler deploy        (from this folder)
-# Dev:     npx wrangler dev           (WebSocket endpoint ws://localhost:8787/ws)
+# Memory Matrix — multiplayer backend (Cloudflare Worker + Durable Object)
+# Deploy:  npx wrangler deploy
+# Then set the game to use it (any ONE of these):
+#   1. window.MM_BACKEND = "wss://<worker-subdomain>.workers.dev/ws" before online.js loads, or
+#   2. open the game with ?mm=wss://<worker-subdomain>.workers.dev/ws (remembered in localStorage), or
+#   3. a custom domain route (see below) + option 1/2 pointing at it.
+
 name = "memory-matrix-mp"
-main = "src/worker.js"
-compatibility_date = "2025-01-15"
+main = "worker.js"
+compatibility_date = "2026-09-01"
 
-# The whole backend is ONE Durable Object: it hosts the matchmaking queue
-# and every live match room. SQLite-backed classes are required on the
-# Workers Free plan and cost nothing extra here (no storage is written).
-[durable_objects]
-bindings = [{ name = "MATCHMAKER", class_name = "MatchMakerDO" }]
+[[durable_objects.bindings]]
+name = "MATCHMAKER"
+class_name = "MatchMakerDO"
 
+# First deploy of the DO class. All matchmaking state lives in ONE global
+# Durable Object (idFromName("global")) — correct at this game's scale; if you
+# ever outgrow one isolate, shard by region/code prefix (rooms already carry
+# a code you could route on).
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MatchMakerDO"]
 
-# No secrets, no vars required. The game knows this Worker's public URL
-# (configured client-side in index.html → window.MM_BACKEND). Nothing here
-# needs an API token at runtime; only YOUR wrangler login deploys it.
+# Optional: serve the worker from your own domain (uncomment + set zone_name)
+# [[routes]]
+# pattern = "mp.example.com/ws"
+# zone_name = "example.com"
