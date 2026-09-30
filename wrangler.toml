@@ -5,7 +5,7 @@
 #   2. open the game with ?mm=wss://<worker-subdomain>.workers.dev/ws (remembered in localStorage), or
 #   3. a custom domain route (see below) + option 1/2 pointing at it.
 
-name = "memory-matrix-mp"
+name = "game-backend"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
